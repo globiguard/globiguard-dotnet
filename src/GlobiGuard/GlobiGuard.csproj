@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>GlobiGuard</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>GlobiGuard</Authors>
+    <Company>GlobiGuard</Company>
+    <Description>Official dependency-minimal .NET SDK for GlobiGuard trusted access workflows.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://globiguard.com</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/globiguard/globiguard-dotnet</RepositoryUrl>
+    <PackageTags>globiguard;ai-governance;compliance;audit;approval;webhooks</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
