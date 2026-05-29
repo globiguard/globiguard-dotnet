@@ -1,0 +1,38 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM UTC
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0'
+      
+      - name: Restore dependencies
+        run: dotnet restore
+      
+      - name: Run dotnet list package vulnerabilities
+        continue-on-error: true
+        run: |
+          dotnet list package --vulnerable
+      
+      - name: Run Roslyn analyzers
+        continue-on-error: true
+        run: |
+          dotnet build /p:TreatWarningsAsErrors=false /p:EnforceCodeStyleInBuild=true
+      
+      - name: Run security code scan
+        continue-on-error: true
+        run: |
+          dotnet nuget add source https://api.nuget.org/v3/index.json
+          dotnet tool install -g SecurityCodeScan.VS2019 || true

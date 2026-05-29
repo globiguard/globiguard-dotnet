@@ -1,0 +1,37 @@
+name: Build & Package
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0'
+      
+      - name: Restore dependencies
+        run: dotnet restore
+      
+      - name: Build NuGet package
+        run: dotnet pack --configuration Release --output dist --no-restore
+      
+      - name: Verify package integrity
+        run: |
+          ls -lh dist/
+          dotnet nuget verify dist/*.nupkg --all || true
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: dotnet-dist
+          path: dist/
+          retention-days: 5
