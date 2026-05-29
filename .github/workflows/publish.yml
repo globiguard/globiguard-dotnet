@@ -1,4 +1,4 @@
-name: Publish Release
+name: Publish to NuGet
 
 on:
   push:
@@ -8,43 +8,12 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0'
-      
-      - name: Restore dependencies
-        run: dotnet restore
-      
-      - name: Build NuGet package
-        run: dotnet pack --configuration Release --output dist --no-restore
-      
-      - name: Publish to NuGet
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          dotnet-version: '8.0'
+      - name: Build and publish
         run: |
-          dotnet nuget push "dist/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
-      
-      - name: Create GitHub Release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: Release ${{ github.ref_name }}
-          body: |
-            ## Release ${{ github.ref_name }}
-            
-            .NET package published to NuGet.
-            
-            ### Installation
-            ```powershell
-            Install-Package GlobiGuard
-            ```
-          draft: false
-          prerelease: false
+          dotnet pack src/GlobiGuard/GlobiGuard.csproj -c Release
+          dotnet nuget push bin/Release/*.nupkg -k ${{ secrets.NUGET_API_KEY }} -s https://api.nuget.org/v3/index.json
