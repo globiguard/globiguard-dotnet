@@ -25,41 +25,56 @@ public sealed record Credential(string Kind, string? ProjectId, string? Token, s
 
 public sealed record ClientOptions(string Environment, IReadOnlyDictionary<string, string> Services, Credential Credential, HttpClient? HttpClient = null);
 
+public sealed class GlobiguardAuthorityException : Exception
+{
+    public string Kind { get; }
+    public string? AuthorizationId { get; }
+    public string? QueueEntryId { get; }
+
+    public GlobiguardAuthorityException(string kind, string message, string? authorizationId = null, string? queueEntryId = null)
+        : base(message)
+    {
+        Kind = kind;
+        AuthorizationId = authorizationId;
+        QueueEntryId = queueEntryId;
+    }
+}
+
 public sealed class GlobiGuardClient
 {
     private readonly Transport _transport;
-    public ResourceClient Actions { get; }
-    public ResourceClient Audit { get; }
+    public ActionsClient Actions { get; }
+    public AuditClient Audit { get; }
     public ResourceClient Installs { get; }
     public ResourceClient Orgs { get; }
     public ResourceClient Policies { get; }
-    public ResourceClient Queue { get; }
+    public QueueClient Queue { get; }
     public ResourceClient Workflows { get; }
     public GovernedActionsClient GovernedActions { get; }
 
-    private GlobiGuardClient(Transport transport)
+    private GlobiGuardClient(Transport transport, bool readOnly)
     {
         _transport = transport;
-        Actions = new ResourceClient(transport, "/v1/actions");
-        Audit = new ResourceClient(transport, "/v1/audit");
-        Installs = new ResourceClient(transport, "/v1/installs");
-        Orgs = new ResourceClient(transport, "/v1/orgs");
-        Policies = new ResourceClient(transport, "/v1/policies");
-        Queue = new ResourceClient(transport, "/v1/queue");
-        Workflows = new ResourceClient(transport, "/v1/workflows");
-        GovernedActions = new GovernedActionsClient(transport);
+        Actions = new ActionsClient(transport, readOnly);
+        Audit = new AuditClient(transport, readOnly);
+        Installs = new ResourceClient(transport, "/v1/installs", readOnly);
+        Orgs = new ResourceClient(transport, "/v1/orgs", readOnly);
+        Policies = new ResourceClient(transport, "/v1/policies", readOnly);
+        Queue = new QueueClient(transport, readOnly);
+        Workflows = new ResourceClient(transport, "/v1/workflows", readOnly);
+        GovernedActions = new GovernedActionsClient(Actions, Audit, Queue);
     }
 
     public static GlobiGuardClient CreateServer(ClientOptions options)
     {
         if (options.Credential.Kind == "publishable") throw new ArgumentException("Server clients require secret or local credentials.");
-        return new GlobiGuardClient(new Transport(options));
+        return new GlobiGuardClient(new Transport(options), false);
     }
 
     public static GlobiGuardClient CreateBrowser(ClientOptions options)
     {
         if (options.Credential.Kind == "secret") throw new ArgumentException("Browser clients cannot use secret credentials.");
-        return new GlobiGuardClient(new Transport(options));
+        return new GlobiGuardClient(new Transport(options), true);
     }
 }
 
@@ -86,10 +101,23 @@ public sealed class Transport
         _http = options.HttpClient ?? new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
     }
 
-    public async Task<JsonElement> RequestAsync(HttpMethod method, string path, object? body = null, IReadOnlyDictionary<string, string>? headers = null, CancellationToken cancellationToken = default)
+    public async Task<JsonElement> RequestAsync(
+        HttpMethod method,
+        string path,
+        object? body = null,
+        IReadOnlyDictionary<string, string>? headers = null,
+        CancellationToken cancellationToken = default,
+        IReadOnlyDictionary<string, string?>? query = null)
     {
         ValidatePath(path);
-        var uri = new Uri(new Uri(_options.Services["controlPlane"].TrimEnd('/') + "/"), path.TrimStart('/'));
+        var uriBuilder = new UriBuilder(new Uri(new Uri(_options.Services["controlPlane"].TrimEnd('/') + "/"), path.TrimStart('/')));
+        if (query is not null)
+        {
+            uriBuilder.Query = string.Join("&", query
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.Value))
+                .Select(entry => $"{Uri.EscapeDataString(entry.Key)}={Uri.EscapeDataString(entry.Value!)}"));
+        }
+        var uri = uriBuilder.Uri;
         using var request = new HttpRequestMessage(method, uri);
         foreach (var header in AuthHeaders())
         {
@@ -139,10 +167,14 @@ public sealed class Transport
     public static void ValidatePath(string path)
     {
         if (!path.StartsWith('/')) throw new ArgumentException("Request path must start with /.");
-        if (path.StartsWith("//") || path.Contains('\\') || path.Contains('?') || path.Contains('#')) throw new ArgumentException("Unsafe request path.");
+        if (path.StartsWith("//") || path.Contains("//") || path.Contains('\\') || path.Contains('?') || path.Contains('#')) throw new ArgumentException("Unsafe request path.");
         if (Uri.TryCreate(path, UriKind.Absolute, out _)) throw new ArgumentException("Absolute request paths are not allowed.");
-        if (path.Split('/').Any(segment => segment is "." or "..")) throw new ArgumentException("Dot segments are not allowed.");
         if (Regex.IsMatch(path, "%(?![0-9A-Fa-f]{2})")) throw new ArgumentException("Invalid percent encoding.");
+        if (path.Split('/').Any(segment =>
+        {
+            var decoded = Uri.UnescapeDataString(segment);
+            return decoded is "." or ".." || decoded.Contains('/') || decoded.Contains('\\');
+        })) throw new ArgumentException("Encoded separators and dot segments are not allowed.");
     }
 }
 
@@ -150,26 +182,236 @@ public sealed class ResourceClient
 {
     private readonly Transport _transport;
     private readonly string _basePath;
-    public ResourceClient(Transport transport, string basePath) { _transport = transport; _basePath = basePath; }
+    private readonly bool _readOnly;
+    public ResourceClient(Transport transport, string basePath, bool readOnly = false) { _transport = transport; _basePath = basePath; _readOnly = readOnly; }
     public Task<JsonElement> ListAsync(CancellationToken cancellationToken = default) => _transport.RequestAsync(HttpMethod.Get, _basePath, cancellationToken: cancellationToken);
     public Task<JsonElement> GetAsync(string id, CancellationToken cancellationToken = default) => _transport.RequestAsync(HttpMethod.Get, $"{_basePath}/{Uri.EscapeDataString(id)}", cancellationToken: cancellationToken);
-    public Task<JsonElement> CreateAsync(object body, CancellationToken cancellationToken = default) => _transport.RequestAsync(HttpMethod.Post, _basePath, body, cancellationToken: cancellationToken);
-    public Task<JsonElement> PostAsync(string suffix, object body, CancellationToken cancellationToken = default) => _transport.RequestAsync(HttpMethod.Post, $"{_basePath}/{suffix.TrimStart('/')}", body, cancellationToken: cancellationToken);
+    public Task<JsonElement> CreateAsync(object body, CancellationToken cancellationToken = default)
+    {
+        RequireWrite();
+        return _transport.RequestAsync(HttpMethod.Post, _basePath, body, cancellationToken: cancellationToken);
+    }
+    public Task<JsonElement> PostAsync(string suffix, object body, CancellationToken cancellationToken = default)
+    {
+        RequireWrite();
+        return _transport.RequestAsync(HttpMethod.Post, $"{_basePath}/{suffix.TrimStart('/')}", body, cancellationToken: cancellationToken);
+    }
+    private void RequireWrite()
+    {
+        if (_readOnly) throw new ArgumentException("Resource writes require a server client.");
+    }
+}
+
+public sealed class ActionsClient
+{
+    private readonly Transport _transport;
+    private readonly bool _readOnly;
+
+    public ActionsClient(Transport transport, bool readOnly)
+    {
+        _transport = transport;
+        _readOnly = readOnly;
+    }
+
+    public Task<JsonElement> GetAuthorizationAsync(string authorizationId, CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(HttpMethod.Get, $"/v1/actions/authorizations/{Uri.EscapeDataString(authorizationId)}", cancellationToken: cancellationToken);
+
+    public Task<JsonElement> GetApprovalAsync(string approvalId, CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(HttpMethod.Get, $"/v1/actions/approvals/{Uri.EscapeDataString(approvalId)}", cancellationToken: cancellationToken);
+
+    public Task<JsonElement> ListEvidenceAsync(
+        string? authorizationId = null,
+        string? approvalId = null,
+        string? workflowRunId = null,
+        CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(
+            HttpMethod.Get,
+            "/v1/actions/evidence",
+            cancellationToken: cancellationToken,
+            query: new Dictionary<string, string?>
+            {
+                ["authorizationId"] = authorizationId,
+                ["approvalId"] = approvalId,
+                ["workflowRunId"] = workflowRunId
+            });
+
+    public Task<JsonElement> GetEvidenceAsync(string evidenceId, CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(HttpMethod.Get, $"/v1/actions/evidence/{Uri.EscapeDataString(evidenceId)}", cancellationToken: cancellationToken);
+
+    public Task<JsonElement> AuthorizeAsync(object request, CancellationToken cancellationToken = default)
+    {
+        RequireWrite();
+        return _transport.RequestAsync(HttpMethod.Post, "/v1/actions/authorize", request, cancellationToken: cancellationToken);
+    }
+
+    public Task<JsonElement> CreateApprovalAsync(object request, CancellationToken cancellationToken = default)
+    {
+        RequireWrite();
+        return _transport.RequestAsync(HttpMethod.Post, "/v1/actions/approvals", request, cancellationToken: cancellationToken);
+    }
+
+    private void RequireWrite()
+    {
+        if (_readOnly) throw new ArgumentException("Action writes require a server client.");
+    }
+}
+
+public sealed class AuditClient
+{
+    private readonly Transport _transport;
+    private readonly bool _readOnly;
+
+    public AuditClient(Transport transport, bool readOnly)
+    {
+        _transport = transport;
+        _readOnly = readOnly;
+    }
+
+    public Task<JsonElement> ListAsync(
+        string? from = null,
+        string? to = null,
+        string? decision = null,
+        string? workflowRunId = null,
+        int? page = null,
+        int? limit = null,
+        CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(
+            HttpMethod.Get,
+            "/v1/audit",
+            cancellationToken: cancellationToken,
+            query: new Dictionary<string, string?>
+            {
+                ["from"] = from,
+                ["to"] = to,
+                ["decision"] = decision,
+                ["workflowRunId"] = workflowRunId,
+                ["page"] = page?.ToString(),
+                ["limit"] = limit?.ToString()
+            });
+
+    public Task<JsonElement> GetAsync(string auditEventId, CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(HttpMethod.Get, $"/v1/audit/{Uri.EscapeDataString(auditEventId)}", cancellationToken: cancellationToken);
+
+    public Task<JsonElement> ExportAsync(object? request = null, CancellationToken cancellationToken = default)
+    {
+        if (_readOnly) throw new ArgumentException("Evidence export requires a server client.");
+        return _transport.RequestAsync(HttpMethod.Post, "/v1/audit/export", request ?? new Dictionary<string, object>(), cancellationToken: cancellationToken);
+    }
+
+    public Task<JsonElement> GetEvidencePackageSummaryAsync(string evidencePackageId, CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(HttpMethod.Get, $"/v1/audit/evidence-packages/{Uri.EscapeDataString(evidencePackageId)}/summary", cancellationToken: cancellationToken);
+
+    public Task<JsonElement> GetIncidentReplayAsync(string lookupKind, string lookupId, CancellationToken cancellationToken = default)
+    {
+        var allowed = new HashSet<string> { "workflowRunId", "correlationId", "queueEntryId", "auditEventId", "authorizationId" };
+        if (!allowed.Contains(lookupKind)) throw new ArgumentException("Unsupported incident replay lookup kind.");
+        return _transport.RequestAsync(
+            HttpMethod.Get,
+            "/v1/audit/incident-replay",
+            cancellationToken: cancellationToken,
+            query: new Dictionary<string, string?> { [lookupKind] = lookupId });
+    }
+}
+
+public sealed class QueueClient
+{
+    private readonly Transport _transport;
+    private readonly bool _readOnly;
+
+    public QueueClient(Transport transport, bool readOnly)
+    {
+        _transport = transport;
+        _readOnly = readOnly;
+    }
+
+    public Task<JsonElement> ListAsync(string? status = null, CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(
+            HttpMethod.Get,
+            "/v1/queue",
+            cancellationToken: cancellationToken,
+            query: new Dictionary<string, string?> { ["status"] = status });
+
+    public Task<JsonElement> GetAsync(string queueEntryId, CancellationToken cancellationToken = default) =>
+        _transport.RequestAsync(HttpMethod.Get, $"/v1/queue/{Uri.EscapeDataString(queueEntryId)}", cancellationToken: cancellationToken);
+
+    public Task<JsonElement> ReviewAsync(string queueEntryId, string action, object? request = null, CancellationToken cancellationToken = default)
+    {
+        if (_readOnly) throw new ArgumentException("Queue review requires a server client.");
+        var allowed = new HashSet<string> { "approve", "reject", "modify", "escalate", "resume" };
+        if (!allowed.Contains(action)) throw new ArgumentException("Unsupported queue review action.");
+        return _transport.RequestAsync(
+            HttpMethod.Post,
+            $"/v1/queue/{Uri.EscapeDataString(queueEntryId)}/{action}",
+            request ?? new Dictionary<string, object>(),
+            cancellationToken: cancellationToken);
+    }
 }
 
 public sealed class GovernedActionsClient
 {
-    private readonly Transport _transport;
-    public GovernedActionsClient(Transport transport) => _transport = transport;
+    private readonly ActionsClient _actions;
+    private readonly AuditClient _audit;
+    private readonly QueueClient _queue;
 
-    public async Task<JsonElement> AuthorizeActionOrThrowAsync(object body, string? idempotencyKey = null, string? correlationId = null, CancellationToken cancellationToken = default)
+    public GovernedActionsClient(ActionsClient actions, AuditClient audit, QueueClient queue)
     {
-        var headers = new Dictionary<string, string>();
-        if (idempotencyKey is not null) headers["Idempotency-Key"] = idempotencyKey;
-        if (correlationId is not null) headers["x-correlation-id"] = correlationId;
-        var result = await _transport.RequestAsync(HttpMethod.Post, "/v1/actions/authorize", body, headers, cancellationToken).ConfigureAwait(false);
-        if (result.TryGetProperty("decision", out var decision) && decision.GetString() is "BLOCK") throw new InvalidOperationException("GlobiGuard blocked the governed action.");
-        return result;
+        _actions = actions;
+        _audit = audit;
+        _queue = queue;
+    }
+
+    public Task<JsonElement> AuthorizeActionAsync(object body, CancellationToken cancellationToken = default) =>
+        _actions.AuthorizeAsync(body, cancellationToken);
+
+    public async Task<JsonElement> AuthorizeActionOrThrowAsync(object body, CancellationToken cancellationToken = default)
+    {
+        var result = await _actions.AuthorizeAsync(body, cancellationToken).ConfigureAwait(false);
+        var decision = result.TryGetProperty("decision", out var decisionValue) ? decisionValue.GetString() : null;
+        var authorizationId = result.TryGetProperty("authorizationId", out var authorizationValue) ? authorizationValue.GetString() : null;
+        var queueEntryId = result.TryGetProperty("queueEntryId", out var queueValue) && queueValue.ValueKind == JsonValueKind.String ? queueValue.GetString() : null;
+        return decision switch
+        {
+            "ALLOW" or "MODIFY" => result,
+            "BLOCK" => throw new GlobiguardAuthorityException("POLICY_BLOCKED", "GlobiGuard blocked the governed action.", authorizationId, queueEntryId),
+            "QUEUE" => throw new GlobiguardAuthorityException("QUEUED_FOR_REVIEW", "GlobiGuard queued the governed action for review; do not perform the downstream business action yet.", authorizationId, queueEntryId),
+            _ => throw new GlobiguardAuthorityException("CONTROL_PLANE_UNAVAILABLE", "GlobiGuard returned an unsupported decision; do not perform the downstream business action.", authorizationId, queueEntryId),
+        };
+    }
+
+    public Task<JsonElement> RequestApprovalAsync(object request, CancellationToken cancellationToken = default) =>
+        _actions.CreateApprovalAsync(request, cancellationToken);
+
+    public Task<JsonElement> GetApprovalStatusAsync(string approvalId, CancellationToken cancellationToken = default) =>
+        _actions.GetApprovalAsync(approvalId, cancellationToken);
+
+    public Task<JsonElement> GetEvidencePackageSummaryAsync(string evidencePackageId, CancellationToken cancellationToken = default) =>
+        _audit.GetEvidencePackageSummaryAsync(evidencePackageId, cancellationToken);
+
+    public Task<JsonElement> GetIncidentReplayAsync(string lookupKind, string lookupId, CancellationToken cancellationToken = default) =>
+        _audit.GetIncidentReplayAsync(lookupKind, lookupId, cancellationToken);
+
+    public async Task<JsonElement> WaitForApprovalAsync(
+        string queueEntryId,
+        int maxAttempts = 60,
+        TimeSpan? interval = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (maxAttempts < 1) throw new ArgumentException("maxAttempts must be at least 1.");
+        var delay = interval ?? TimeSpan.FromSeconds(1);
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            var entry = await _queue.GetAsync(queueEntryId, cancellationToken).ConfigureAwait(false);
+            var status = entry.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : null;
+            if (status is "APPROVED" or "AUTO_APPROVED" or "RESUMED") return entry;
+            if (status is "REJECTED" or "EXPIRED" or "FAILED")
+                throw new GlobiguardAuthorityException("POLICY_BLOCKED", $"Queued action resolved as {status}; do not perform the downstream business action.", queueEntryId: queueEntryId);
+            if (status is "MODIFIED")
+                throw new GlobiguardAuthorityException("STEP_UP_REQUIRED", "The reviewer approved a modified action summary. Rebuild the real payload and request a new authorization before executing it.", queueEntryId: queueEntryId);
+            if (status is not ("PENDING" or "ESCALATED"))
+                throw new GlobiguardAuthorityException("CONTROL_PLANE_UNAVAILABLE", "GlobiGuard returned an unsupported approval state; the downstream business action remains stopped.", queueEntryId: queueEntryId);
+            if (attempt < maxAttempts) await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
+        throw new GlobiguardAuthorityException("QUEUED_FOR_REVIEW", "Queued action is still pending after the configured wait attempts; do not perform the downstream business action yet.", queueEntryId: queueEntryId);
     }
 }
 
@@ -206,13 +448,15 @@ public static class Bootstrap
         Validate(profile);
         return new()
         {
+            ["packageName"] = packageName,
+            ["packageVersion"] = packageVersion,
+            ["integrationKind"] = integrationKind,
+            ["runtimeKind"] = runtimeKind,
             ["environment"] = profile.Environment,
             ["deploymentMode"] = profile.DeploymentMode,
             ["issuerMode"] = profile.IssuerMode,
             ["installReporting"] = profile.InstallReporting,
             ["installLabel"] = profile.InstallLabel,
-            ["package"] = new Dictionary<string, object?> { ["name"] = packageName, ["version"] = packageVersion },
-            ["integration"] = new Dictionary<string, object?> { ["kind"] = integrationKind, ["runtime"] = runtimeKind }
         };
     }
 
@@ -228,25 +472,118 @@ public static class Bootstrap
     }
 }
 
+public sealed record EntitlementVerificationOptions(
+    string? ExpectedIssuer = null,
+    string? ExpectedOrgId = null,
+    string? ExpectedProjectId = null,
+    string? ExpectedEnvironment = null,
+    string? ExpectedDeploymentMode = null,
+    DateTimeOffset? Now = null);
+
 public static class EntitlementManifestVerifier
 {
-    public static JsonElement Verify(string compactJws, IReadOnlyDictionary<string, byte[]> publicKeysById, Func<byte[], byte[], byte[], bool> verifyEd25519)
+    private const string ManifestType = "globiguard.entitlement.v1";
+    private static readonly HashSet<string> Environments = new() { "sandbox", "live" };
+    private static readonly HashSet<string> DeploymentModes = new() { "self_hosted", "sovereign" };
+    private static readonly HashSet<string> CommercialPlans = new() { "FREE", "STARTER", "GROWTH", "SCALE", "ENTERPRISE" };
+    private static readonly HashSet<string> BillingStatuses = new() { "FREE", "PILOT", "ACTIVE", "GRACE", "PAST_DUE", "SUSPENDED", "CANCELED" };
+    private static readonly HashSet<string> OverageModes = new() { "NONE", "METERED", "CONTRACT" };
+
+    public static JsonElement Verify(
+        string compactJws,
+        IReadOnlyDictionary<string, byte[]> publicKeysById,
+        Func<byte[], byte[], byte[], bool> verifyEd25519,
+        EntitlementVerificationOptions? options = null)
     {
+        options ??= new EntitlementVerificationOptions();
         var parts = compactJws.Split('.');
         if (parts.Length != 3) throw new ArgumentException("Entitlement manifest must be compact JWS.");
-        var protectedHeader = JsonDocument.Parse(Base64UrlDecode(parts[0])).RootElement;
-        if (protectedHeader.GetProperty("alg").GetString() != "EdDSA") throw new ArgumentException("Entitlement manifest must use EdDSA.");
-        var kid = protectedHeader.GetProperty("kid").GetString() ?? throw new ArgumentException("Missing key id.");
+        using var headerDocument = JsonDocument.Parse(Base64UrlDecode(parts[0]));
+        var protectedHeader = headerDocument.RootElement;
+        if (RequireString(protectedHeader, "alg") != "EdDSA" || RequireString(protectedHeader, "typ") != ManifestType)
+            throw new ArgumentException("Unsupported entitlement manifest protected header.");
+        var kid = RequireString(protectedHeader, "kid");
         if (!publicKeysById.TryGetValue(kid, out var publicKey)) throw new ArgumentException("Unknown entitlement signing key.");
         var signingInput = Encoding.ASCII.GetBytes(parts[0] + "." + parts[1]);
         var signature = Base64UrlDecode(parts[2]);
         if (!verifyEd25519(publicKey, signingInput, signature)) throw new CryptographicException("Invalid entitlement manifest signature.");
-        var payload = JsonDocument.Parse(Base64UrlDecode(parts[1])).RootElement.Clone();
-        if (payload.GetProperty("schema").GetString() != "globiguard.entitlement_manifest.v1") throw new ArgumentException("Unsupported entitlement manifest schema.");
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        if (payload.TryGetProperty("nbf", out var nbf) && nbf.GetInt64() > now) throw new ArgumentException("Entitlement manifest is not active yet.");
-        if (payload.TryGetProperty("exp", out var exp) && exp.GetInt64() <= now) throw new ArgumentException("Entitlement manifest is expired.");
+        using var payloadDocument = JsonDocument.Parse(Base64UrlDecode(parts[1]));
+        var payload = payloadDocument.RootElement.Clone();
+        ValidatePayload(payload);
+
+        var now = options.Now ?? DateTimeOffset.UtcNow;
+        var issuedAt = RequireTimestamp(payload, "issuedAt");
+        var notBefore = RequireTimestamp(payload, "notBefore");
+        var expiresAt = RequireTimestamp(payload, "expiresAt");
+        if (issuedAt > expiresAt || notBefore >= expiresAt) throw new ArgumentException("Entitlement manifest timestamps are inconsistent.");
+        if (notBefore > now) throw new ArgumentException("Entitlement manifest is not active yet.");
+        if (expiresAt <= now) throw new ArgumentException("Entitlement manifest has expired.");
+
+        var subject = payload.GetProperty("subject");
+        Expect(options.ExpectedIssuer, RequireString(payload, "issuer"), "issuer");
+        Expect(options.ExpectedOrgId, RequireString(subject, "orgId"), "organization");
+        Expect(options.ExpectedProjectId, RequireString(subject, "projectId"), "project");
+        Expect(options.ExpectedEnvironment, RequireString(subject, "environment"), "environment");
+        Expect(options.ExpectedDeploymentMode, RequireString(subject, "deploymentMode"), "deployment mode");
         return payload;
+    }
+
+    private static void ValidatePayload(JsonElement payload)
+    {
+        if (RequireString(payload, "manifestType") != ManifestType || payload.GetProperty("manifestVersion").GetInt32() != 1)
+            throw new ArgumentException("Unsupported entitlement manifest payload.");
+        foreach (var field in new[] { "manifestId", "issuer", "issuedAt", "notBefore", "expiresAt" }) RequireString(payload, field);
+
+        var subject = RequireObject(payload, "subject");
+        foreach (var field in new[] { "orgId", "workspaceName", "orgSlug", "projectId", "projectSlug" }) RequireString(subject, field);
+        if (!Environments.Contains(RequireString(subject, "environment"))) throw new ArgumentException("Entitlement manifest subject environment is invalid.");
+        if (!DeploymentModes.Contains(RequireString(subject, "deploymentMode"))) throw new ArgumentException("Entitlement manifest subject deployment mode is invalid.");
+
+        var commercial = RequireObject(payload, "commercial");
+        if (!CommercialPlans.Contains(RequireString(commercial, "commercialPlan"))) throw new ArgumentException("Entitlement manifest commercial plan is invalid.");
+        if (!BillingStatuses.Contains(RequireString(commercial, "billingStatus"))) throw new ArgumentException("Entitlement manifest billing status is invalid.");
+        if (!commercial.TryGetProperty("pilotActive", out var pilotActive) || pilotActive.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            throw new ArgumentException("Entitlement manifest pilotActive must be boolean.");
+
+        var entitlements = RequireObject(payload, "entitlements");
+        ValidateNullableCounter(entitlements, "includedQueriesPerMonth");
+        ValidateNullableCounter(entitlements, "frameworkSlots");
+        if (!OverageModes.Contains(RequireString(entitlements, "overageMode"))) throw new ArgumentException("Entitlement manifest overage mode is invalid.");
+    }
+
+    private static JsonElement RequireObject(JsonElement parent, string name)
+    {
+        if (!parent.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Object)
+            throw new ArgumentException($"Entitlement manifest field {name} must be an object.");
+        return value;
+    }
+
+    private static string RequireString(JsonElement parent, string name)
+    {
+        if (!parent.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString()))
+            throw new ArgumentException($"Entitlement manifest field {name} must be a non-empty string.");
+        return value.GetString()!;
+    }
+
+    private static DateTimeOffset RequireTimestamp(JsonElement parent, string name)
+    {
+        if (!DateTimeOffset.TryParse(RequireString(parent, name), out var value))
+            throw new ArgumentException($"Entitlement manifest field {name} must be an ISO timestamp.");
+        return value;
+    }
+
+    private static void ValidateNullableCounter(JsonElement parent, string name)
+    {
+        if (!parent.TryGetProperty(name, out var value)) throw new ArgumentException($"Entitlement manifest field {name} is required.");
+        if (value.ValueKind == JsonValueKind.Null) return;
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var count) || count < 0)
+            throw new ArgumentException($"Entitlement manifest field {name} must be null or a non-negative integer.");
+    }
+
+    private static void Expect(string? expected, string actual, string label)
+    {
+        if (expected is not null && !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(expected), Encoding.UTF8.GetBytes(actual)))
+            throw new ArgumentException($"Entitlement manifest {label} does not match the expected value.");
     }
 
     private static byte[] Base64UrlDecode(string value)

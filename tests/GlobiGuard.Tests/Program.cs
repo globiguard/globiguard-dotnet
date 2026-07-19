@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using GlobiGuard;
 
 // PATH VALIDATION TESTS
@@ -55,6 +56,79 @@ Assert((string?)registration["packageName"] == "GlobiGuard", "bootstrap package 
 Assert((string?)registration["packageVersion"] == "0.1.0", "bootstrap package version");
 Assert((string?)registration["integrationKind"] == "sdk", "bootstrap integration kind");
 Assert((string?)registration["runtimeKind"] == "dotnet", "bootstrap runtime kind");
+
+// BROWSER AUTHORITY BOUNDARY
+var browser = GlobiGuardClient.CreateBrowser(new ClientOptions(
+    EnvironmentName.Sandbox,
+    new Dictionary<string, string> { ["controlPlane"] = "https://api.globiguard.com" },
+    Credential.Publishable("proj_123", "ggpk_test", EnvironmentName.Sandbox)));
+ExpectThrows(
+    () => browser.Policies.CreateAsync(new { name = "must-not-send" }).GetAwaiter().GetResult(),
+    "browser resource writes must fail before transport");
+
+// CURRENT ENTITLEMENT MANIFEST CONTRACT
+var entitlementHeader = JsonSerializer.Serialize(new
+{
+    alg = "EdDSA",
+    kid = "kid_test",
+    typ = "globiguard.entitlement.v1"
+});
+var entitlementPayload = JsonSerializer.Serialize(new
+{
+    manifestType = "globiguard.entitlement.v1",
+    manifestVersion = 1,
+    manifestId = "manifest_123",
+    issuer = "https://api.globiguard.com",
+    issuedAt = "2026-05-29T10:00:00Z",
+    notBefore = "2026-05-29T10:00:00Z",
+    expiresAt = "2026-05-30T10:00:00Z",
+    subject = new
+    {
+        orgId = "org_123",
+        workspaceName = "Acme",
+        orgSlug = "acme",
+        projectId = "proj_123",
+        projectSlug = "main",
+        environment = "sandbox",
+        deploymentMode = "self_hosted"
+    },
+    commercial = new
+    {
+        commercialPlan = "GROWTH",
+        billingStatus = "ACTIVE",
+        pilotActive = false
+    },
+    entitlements = new
+    {
+        includedQueriesPerMonth = 10_000,
+        frameworkSlots = 3,
+        overageMode = "METERED"
+    }
+});
+var entitlementToken = $"{Base64Url(entitlementHeader)}.{Base64Url(entitlementPayload)}.{Base64Url("signature")}";
+var verifiedEntitlement = EntitlementManifestVerifier.Verify(
+    entitlementToken,
+    new Dictionary<string, byte[]> { ["kid_test"] = Encoding.UTF8.GetBytes("public-key") },
+    (_, signingInput, signatureBytes) =>
+        Encoding.ASCII.GetString(signingInput).StartsWith(Base64Url(entitlementHeader) + ".", StringComparison.Ordinal)
+        && Encoding.UTF8.GetString(signatureBytes) == "signature",
+    new EntitlementVerificationOptions(
+        ExpectedIssuer: "https://api.globiguard.com",
+        ExpectedOrgId: "org_123",
+        ExpectedProjectId: "proj_123",
+        ExpectedEnvironment: "sandbox",
+        ExpectedDeploymentMode: "self_hosted",
+        Now: DateTimeOffset.Parse("2026-05-29T10:30:00Z")));
+Assert(
+    verifiedEntitlement.GetProperty("commercial").GetProperty("commercialPlan").GetString() == "GROWTH",
+    "current entitlement manifest verification");
+ExpectThrows(
+    () => EntitlementManifestVerifier.Verify(
+        entitlementToken,
+        new Dictionary<string, byte[]> { ["kid_test"] = Encoding.UTF8.GetBytes("public-key") },
+        (_, _, _) => true,
+        new EntitlementVerificationOptions(ExpectedOrgId: "org_other", Now: DateTimeOffset.Parse("2026-05-29T10:30:00Z"))),
+    "entitlement subject mismatch must fail closed");
 
 // WEBHOOK VERIFICATION TESTS
 var body = Encoding.UTF8.GetBytes("{\"type\":\"globiguard.test\"}");
@@ -133,4 +207,9 @@ static void ExpectThrows(Action action, string name)
     }
     throw new Exception($"Expected exception: {name}");
 }
+
+static string Base64Url(string value) => Convert.ToBase64String(Encoding.UTF8.GetBytes(value))
+    .TrimEnd('=')
+    .Replace('+', '-')
+    .Replace('/', '_');
 

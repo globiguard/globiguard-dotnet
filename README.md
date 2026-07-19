@@ -25,11 +25,32 @@ var client = GlobiGuardClient.CreateServer(new ClientOptions(
 
 var decision = await client.GovernedActions.AuthorizeActionOrThrowAsync(new Dictionary<string, object?>
 {
-    ["actionType"] = "refund",
-    ["actor"] = new Dictionary<string, object?> { ["id"] = "user_123" },
-    ["target"] = new Dictionary<string, object?> { ["id"] = "order_456" }
+    ["context"] = new Dictionary<string, object?>
+    {
+        ["actionType"] = "refund.create",
+        ["destination"] = new Dictionary<string, object?>
+        {
+            ["type"] = "custom",
+            ["name"] = "payments-production"
+        },
+        ["dataClasses"] = new[] { "CONFIDENTIAL" },
+        ["actor"] = new Dictionary<string, object?>
+        {
+            ["id"] = "support-agent-123",
+            ["type"] = "agent"
+        },
+        ["purpose"] = "Resolve an approved customer escalation",
+        ["correlationId"] = "case_456",
+        ["idempotencyKey"] = "case_456:refund:v1"
+    }
 });
 ```
+
+`AuthorizeActionOrThrowAsync` returns only `ALLOW` or `MODIFY`. It raises
+`GlobiguardAuthorityException` for `QUEUE` and `BLOCK`, keeping the downstream
+business action stopped. Evidence summaries and incident history are available
+through `client.Audit.GetEvidencePackageSummaryAsync(...)` and
+`client.Audit.GetIncidentReplayAsync(...)`.
 
 ## Webhooks
 
