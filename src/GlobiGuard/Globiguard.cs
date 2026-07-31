@@ -349,6 +349,8 @@ public sealed class QueueClient
 
 public sealed class GovernedActionsClient
 {
+    public static readonly TimeSpan MaxExecutionAuthorizationTtl = TimeSpan.FromMinutes(5);
+
     private readonly ActionsClient _actions;
     private readonly AuditClient _audit;
     private readonly QueueClient _queue;
@@ -366,16 +368,64 @@ public sealed class GovernedActionsClient
     public async Task<JsonElement> AuthorizeActionOrThrowAsync(object body, CancellationToken cancellationToken = default)
     {
         var result = await _actions.AuthorizeAsync(body, cancellationToken).ConfigureAwait(false);
+        AssertExecutableAuthorization(result, IsDryRun(body));
+        return result;
+    }
+
+    public static void AssertExecutableAuthorization(JsonElement result, bool simulation = false, DateTimeOffset? now = null)
+    {
         var decision = result.TryGetProperty("decision", out var decisionValue) ? decisionValue.GetString() : null;
         var authorizationId = result.TryGetProperty("authorizationId", out var authorizationValue) ? authorizationValue.GetString() : null;
         var queueEntryId = result.TryGetProperty("queueEntryId", out var queueValue) && queueValue.ValueKind == JsonValueKind.String ? queueValue.GetString() : null;
-        return decision switch
+        switch (decision)
         {
-            "ALLOW" or "MODIFY" => result,
-            "BLOCK" => throw new GlobiguardAuthorityException("POLICY_BLOCKED", "GlobiGuard blocked the governed action.", authorizationId, queueEntryId),
-            "QUEUE" => throw new GlobiguardAuthorityException("QUEUED_FOR_REVIEW", "GlobiGuard queued the governed action for review; do not perform the downstream business action yet.", authorizationId, queueEntryId),
-            _ => throw new GlobiguardAuthorityException("CONTROL_PLANE_UNAVAILABLE", "GlobiGuard returned an unsupported decision; do not perform the downstream business action.", authorizationId, queueEntryId),
-        };
+            case "BLOCK":
+                throw new GlobiguardAuthorityException("POLICY_BLOCKED", "GlobiGuard blocked the governed action.", authorizationId, queueEntryId);
+            case "QUEUE":
+                throw new GlobiguardAuthorityException("QUEUED_FOR_REVIEW", "GlobiGuard queued the governed action for review; do not perform the downstream business action yet.", authorizationId, queueEntryId);
+            case "MODIFY":
+                throw new GlobiguardAuthorityException("STEP_UP_REQUIRED", "Apply modifications through a typed handler and reauthorize the exact resulting action before execution.", authorizationId, queueEntryId);
+            case "ALLOW":
+                break;
+            default:
+                throw new GlobiguardAuthorityException("CONTROL_PLANE_UNAVAILABLE", "GlobiGuard returned an unsupported decision; the governed action remains stopped.", authorizationId, queueEntryId);
+        }
+
+        if (simulation)
+            throw NonExecutable("A dry-run decision is not an execution permit. Reauthorize with dryRun disabled.", authorizationId, queueEntryId);
+        if (!result.TryGetProperty("executable", out var executable) || executable.ValueKind != JsonValueKind.True ||
+            !result.TryGetProperty("nextAction", out var nextAction) || nextAction.GetString() != "EXECUTE_EXACT_ACTION_ONCE")
+            throw NonExecutable("The control plane marked this response as non-executable. Reauthorize before execution.", authorizationId, queueEntryId);
+
+        var approvalState = result.TryGetProperty("approvalState", out var approval) ? approval.GetString() : null;
+        if (approvalState is not ("NOT_REQUIRED" or "APPROVED"))
+            throw NonExecutable("Resolve review and reauthorize the exact current action before execution.", authorizationId, queueEntryId);
+
+        var current = now ?? DateTimeOffset.UtcNow;
+        if (!result.TryGetProperty("expiresAt", out var expiryValue) || expiryValue.ValueKind != JsonValueKind.String ||
+            !DateTimeOffset.TryParse(expiryValue.GetString(), out var expiry) || expiry <= current || expiry - current > MaxExecutionAuthorizationTtl)
+            throw NonExecutable("Execution authority must have a current, bounded expiry. Reauthorize immediately before execution.", authorizationId, queueEntryId);
+
+        if (result.TryGetProperty("obligations", out var obligations) && obligations.ValueKind == JsonValueKind.Array && obligations.GetArrayLength() > 0)
+            throw NonExecutable("Enforce all obligations and reauthorize before execution.", authorizationId, queueEntryId);
+        if (result.TryGetProperty("modifications", out var modifications) && modifications.ValueKind == JsonValueKind.Object && modifications.EnumerateObject().Any())
+            throw NonExecutable("Apply all modifications and reauthorize the exact resulting action before execution.", authorizationId, queueEntryId);
+    }
+
+    private static GlobiguardAuthorityException NonExecutable(string message, string? authorizationId, string? queueEntryId) =>
+        new("STEP_UP_REQUIRED", message, authorizationId, queueEntryId);
+
+    private static bool IsDryRun(object body)
+    {
+        try
+        {
+            var request = JsonSerializer.SerializeToElement(body);
+            return request.ValueKind == JsonValueKind.Object && request.TryGetProperty("dryRun", out var dryRun) && dryRun.ValueKind == JsonValueKind.True;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     public Task<JsonElement> RequestApprovalAsync(object request, CancellationToken cancellationToken = default) =>

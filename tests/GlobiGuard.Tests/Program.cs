@@ -66,6 +66,37 @@ ExpectThrows(
     () => browser.Policies.CreateAsync(new { name = "must-not-send" }).GetAwaiter().GetResult(),
     "browser resource writes must fail before transport");
 
+// EXECUTION AUTHORITY BOUNDARY
+var authorityNow = DateTimeOffset.UtcNow;
+var executableAllow = JsonSerializer.SerializeToElement(new
+{
+    decision = "ALLOW",
+    executable = true,
+    nextAction = "EXECUTE_EXACT_ACTION_ONCE",
+    approvalState = "NOT_REQUIRED",
+    expiresAt = authorityNow.AddMinutes(1),
+    obligations = Array.Empty<string>(),
+    modifications = new { }
+});
+GovernedActionsClient.AssertExecutableAuthorization(executableAllow, now: authorityNow);
+foreach (var stopped in new[]
+{
+    JsonSerializer.SerializeToElement(new { decision = "MODIFY" }),
+    JsonSerializer.SerializeToElement(new { decision = "QUEUE" }),
+    JsonSerializer.SerializeToElement(new { decision = "BLOCK" }),
+    JsonSerializer.SerializeToElement(new { decision = "UNKNOWN" }),
+    JsonSerializer.SerializeToElement(new { decision = "ALLOW", executable = false, nextAction = "EXECUTE_EXACT_ACTION_ONCE", approvalState = "NOT_REQUIRED", expiresAt = authorityNow.AddMinutes(1) }),
+    JsonSerializer.SerializeToElement(new { decision = "ALLOW", executable = true, nextAction = "REAUTHORIZE_EXACT_ACTION", approvalState = "NOT_REQUIRED", expiresAt = authorityNow.AddMinutes(1) }),
+    JsonSerializer.SerializeToElement(new { decision = "ALLOW", executable = true, nextAction = "EXECUTE_EXACT_ACTION_ONCE", approvalState = "PENDING", expiresAt = authorityNow.AddMinutes(1) }),
+    JsonSerializer.SerializeToElement(new { decision = "ALLOW", executable = true, nextAction = "EXECUTE_EXACT_ACTION_ONCE", approvalState = "NOT_REQUIRED", expiresAt = authorityNow.AddMinutes(10) }),
+    JsonSerializer.SerializeToElement(new { decision = "ALLOW", executable = true, nextAction = "EXECUTE_EXACT_ACTION_ONCE", approvalState = "NOT_REQUIRED", expiresAt = authorityNow.AddMinutes(1), obligations = new[] { "redact" } }),
+    JsonSerializer.SerializeToElement(new { decision = "ALLOW", executable = true, nextAction = "EXECUTE_EXACT_ACTION_ONCE", approvalState = "NOT_REQUIRED", expiresAt = authorityNow.AddMinutes(1), modifications = new { recipient = "safe" } })
+})
+{
+    ExpectThrows(() => GovernedActionsClient.AssertExecutableAuthorization(stopped, now: authorityNow), "unresolved authority must fail closed");
+}
+ExpectThrows(() => GovernedActionsClient.AssertExecutableAuthorization(executableAllow, simulation: true, now: authorityNow), "dry-run ALLOW must fail closed");
+
 // CURRENT ENTITLEMENT MANIFEST CONTRACT
 var entitlementHeader = JsonSerializer.Serialize(new
 {

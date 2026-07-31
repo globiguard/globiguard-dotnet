@@ -46,9 +46,11 @@ var decision = await client.GovernedActions.AuthorizeActionOrThrowAsync(new Dict
 });
 ```
 
-`AuthorizeActionOrThrowAsync` returns only `ALLOW` or `MODIFY`. It raises
-`GlobiguardAuthorityException` for `QUEUE` and `BLOCK`, keeping the downstream
-business action stopped. Evidence summaries and incident history are available
+`AuthorizeActionOrThrowAsync` returns only a current, short-lived,
+obligation-free `ALLOW` that explicitly authorizes the exact action once. It
+raises `GlobiguardAuthorityException` for `MODIFY`, `QUEUE`, `BLOCK`, dry-run,
+expired, and incomplete responses, keeping the downstream business action
+stopped. Evidence summaries and incident history are available
 through `client.Audit.GetEvidencePackageSummaryAsync(...)` and
 `client.Audit.GetIncidentReplayAsync(...)`.
 
