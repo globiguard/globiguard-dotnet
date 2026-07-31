@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Fixed request-path validation on Linux so valid root-relative API paths are
+  accepted while URLs, traversal, encoded separators, queries, and fragments
+  remain rejected.
+- Updated the SDK identification header to the published package version.
+
 ## 0.2.0
 
 - Tightened governed-action execution so only a current, obligation-free

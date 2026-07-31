@@ -146,7 +146,7 @@ public sealed class Transport
     {
         var headers = new Dictionary<string, string>
         {
-            ["x-globiguard-client"] = "globiguard-dotnet/0.1.0",
+            ["x-globiguard-client"] = "globiguard-dotnet/0.2.1",
             ["x-globiguard-environment"] = _options.Environment
         };
         if (_options.Credential.Kind == "local")
@@ -168,7 +168,6 @@ public sealed class Transport
     {
         if (!path.StartsWith('/')) throw new ArgumentException("Request path must start with /.");
         if (path.StartsWith("//") || path.Contains("//") || path.Contains('\\') || path.Contains('?') || path.Contains('#')) throw new ArgumentException("Unsafe request path.");
-        if (Uri.TryCreate(path, UriKind.Absolute, out _)) throw new ArgumentException("Absolute request paths are not allowed.");
         if (Regex.IsMatch(path, "%(?![0-9A-Fa-f]{2})")) throw new ArgumentException("Invalid percent encoding.");
         if (path.Split('/').Any(segment =>
         {
