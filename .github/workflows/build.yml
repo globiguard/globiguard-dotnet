@@ -2,36 +2,40 @@ name: Build & Package
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ sol, main, develop ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ sol, main, develop ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v7
+
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '9.0'
-      
+          dotnet-version: '9.0.x'
+
       - name: Restore dependencies
-        run: dotnet restore
-      
+        run: dotnet restore tests/GlobiGuard.Tests/GlobiGuard.Tests.csproj
+
+      - name: Run SDK contract tests
+        run: dotnet run --project tests/GlobiGuard.Tests/GlobiGuard.Tests.csproj --configuration Release --no-restore
+
       - name: Build NuGet package
-        run: dotnet pack --configuration Release --output dist --no-restore
-      
+        run: dotnet pack src/GlobiGuard/GlobiGuard.csproj --configuration Release --output dist --no-restore
+
       - name: Verify package integrity
         run: |
           ls -lh dist/
           dotnet nuget verify dist/*.nupkg --all || true
-      
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: dotnet-dist
           path: dist/
           retention-days: 5
+          if-no-files-found: error

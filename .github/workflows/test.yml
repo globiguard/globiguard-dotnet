@@ -2,14 +2,17 @@ name: Test & Lint
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ sol, main, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ sol, main, develop ]
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Run tests
-        run: dotnet test
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '9.0.x'
+      - name: Run SDK contract tests
+        run: dotnet run --project tests/GlobiGuard.Tests/GlobiGuard.Tests.csproj --configuration Release

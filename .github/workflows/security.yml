@@ -2,37 +2,27 @@ name: Security Scan
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ sol, main, develop ]
   schedule:
     - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM UTC
 
 jobs:
   security:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v7
+
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '9.0'
-      
-      - name: Restore dependencies
-        run: dotnet restore
-      
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies with NuGet audit
+        run: dotnet restore tests/GlobiGuard.Tests/GlobiGuard.Tests.csproj -p:NuGetAudit=true -p:NuGetAuditMode=all
+
       - name: Run dotnet list package vulnerabilities
-        continue-on-error: true
-        run: |
-          dotnet list package --vulnerable
-      
+        run: dotnet list src/GlobiGuard/GlobiGuard.csproj package --vulnerable --include-transitive
+
       - name: Run Roslyn analyzers
-        continue-on-error: true
-        run: |
-          dotnet build /p:TreatWarningsAsErrors=false /p:EnforceCodeStyleInBuild=true
-      
-      - name: Run security code scan
-        continue-on-error: true
-        run: |
-          dotnet nuget add source https://api.nuget.org/v3/index.json
-          dotnet tool install -g SecurityCodeScan.VS2019 || true
+        run: dotnet build tests/GlobiGuard.Tests/GlobiGuard.Tests.csproj --configuration Release --no-restore /p:TreatWarningsAsErrors=false /p:EnforceCodeStyleInBuild=true
